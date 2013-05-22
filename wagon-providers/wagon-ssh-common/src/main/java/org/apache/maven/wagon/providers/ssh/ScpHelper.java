@@ -42,8 +42,14 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.List;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
+
+import org.apache.commons.compress.archivers.ArchiveEntry;
+import org.apache.commons.compress.archivers.ArchiveOutputStream;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
 
 /**
  * Scp helper for general algorithms on ssh server.
@@ -144,27 +150,26 @@ public class ScpHelper
         return privateKey;
     }
 
-    public static void createZip( List<String> files, File zipName, File basedir )
+    public static void createArchive( ArchiveOutputStream os, List<String> files, File basedir )
         throws IOException
     {
-        ZipOutputStream zos = new ZipOutputStream( new FileOutputStream( zipName ) );
-
         try
         {
             for ( String file : files )
             {
                 file = file.replace( '\\', '/' );
 
-                writeZipEntry( zos, new File( basedir, file ), file );
+                writeArchiveEntry( os, new File( basedir, file ), file );
             }
         }
         finally
         {
-            IOUtil.close( zos );
+            os.finish();
+            IOUtil.close( os );
         }
     }
 
-    private static void writeZipEntry( ZipOutputStream jar, File source, String entryName )
+    private static void writeArchiveEntry( ArchiveOutputStream os, File source, String entryName )
         throws IOException
     {
         byte[] buffer = new byte[1024];
@@ -175,14 +180,19 @@ public class ScpHelper
 
         try
         {
-            ZipEntry entry = new ZipEntry( entryName );
+            ArchiveEntry entry;
 
-            jar.putNextEntry( entry );
+            entry = ( os instanceof ZipArchiveOutputStream ) ?
+                new ZipArchiveEntry( source, entryName ) : new TarArchiveEntry( source, entryName );
+
+            os.putArchiveEntry( entry );
 
             while ( ( bytesRead = is.read( buffer ) ) != -1 )
             {
-                jar.write( buffer, 0, bytesRead );
+                os.write( buffer, 0, bytesRead );
             }
+
+            os.closeArchiveEntry();
         }
         finally
         {
@@ -203,12 +213,13 @@ public class ScpHelper
     }
 
     /**
-     * Put a whole directory content, by transferring a unique zip file and uncompressing it
-     * on the target ssh server with <code>unzip</code> command.
+     * Put a whole directory content, by transferring a unique zip/tar.gz file and uncompressing it
+     * on the target ssh server with <code>unzip</code> or <code>tar</code> command.
      */
     public void putDirectory( Wagon wagon, File sourceDirectory, String destinationDirectory )
         throws TransferFailedException, ResourceDoesNotExistException, AuthorizationException
     {
+        // create remote directory
         Repository repository = wagon.getRepository();
 
         String basedir = repository.getBasedir();
@@ -218,69 +229,95 @@ public class ScpHelper
         String path = getPath( basedir, destDir );
         try
         {
-            if ( repository.getPermissions() != null )
-            {
-                String dirPerms = repository.getPermissions().getDirectoryMode();
-
-                if ( dirPerms != null )
-                {
-                    String umaskCmd = "umask " + PermissionModeUtils.getUserMaskFor( dirPerms );
-                    executor.executeCommand( umaskCmd );
-                }
-            }
-
-            //String mkdirCmd = "mkdir -p " + path;
-            String mkdirCmd = "mkdir -p \"" + path + "\"";
-
-            executor.executeCommand( mkdirCmd );
+            createRemoteDirectories(path, repository.getPermissions());
         }
         catch ( CommandExecutionException e )
         {
             throw new TransferFailedException( "Error performing commands for file transfer", e );
         }
 
-        File zipFile;
+
+        boolean useTargz = false;
+        String wagonTargz = System.getProperty( "wagon.useTargz" );
+        if ( wagonTargz != null && wagonTargz.equals( "true" ) )
+        {
+            useTargz = true;
+        }
+
+        File archive;
         try
         {
-            zipFile = File.createTempFile( "wagon", ".zip" );
-            zipFile.deleteOnExit();
+            List<String> files;
+            files = FileUtils.getFileNames( sourceDirectory, "**/**", "", false );
 
-            List<String> files = FileUtils.getFileNames( sourceDirectory, "**/**", "", false );
+            archive = File.createTempFile( "wagon", useTargz ? ".tar.gz" : ".zip" );
+            archive.deleteOnExit();
 
-            createZip( files, zipFile, sourceDirectory );
+            ArchiveOutputStream os;
+            if ( useTargz )
+            {
+                // tar.gz
+                FileOutputStream fos = new FileOutputStream( archive );
+                GzipCompressorOutputStream gzos = new GzipCompressorOutputStream( fos );
+                os = new TarArchiveOutputStream( gzos );
+            }
+            else
+            {
+                // zip
+                os = new ZipArchiveOutputStream( new FileOutputStream( archive ) );
+            }
+
+            createArchive( os, files, sourceDirectory );
         }
         catch ( IOException e )
         {
-            throw new TransferFailedException( "Unable to create ZIP archive of directory", e );
+            throw new TransferFailedException( "Unable to create archive of directory", e );
         }
-
-        wagon.put( zipFile, getPath( destDir, zipFile.getName() ) );
 
         try
         {
-            //executor.executeCommand(
-            //    "cd " + path + "; unzip -q -o " + zipFile.getName() + "; rm -f " + zipFile.getName() );
-            executor.executeCommand( "cd \"" + path + "\"; unzip -q -o \"" + zipFile.getName() + "\"; rm -f \"" + zipFile.getName() + "\"" );
+            // upload and uncompress
+            String uncompressCommand = useTargz ? "tar xzf" : "unzip -q -o";
+            uncompressCommand += " \"" + archive.getName() + "\"";
 
-            zipFile.delete();
+            uploadFiles(wagon, destinationDirectory, archive, uncompressCommand);
 
-            RepositoryPermissions permissions = repository.getPermissions();
-
-            if ( permissions != null && permissions.getGroup() != null )
-            {
-                //executor.executeCommand( "chgrp -Rf " + permissions.getGroup() + " " + path );
-                executor.executeCommand( "chgrp -Rf " + permissions.getGroup() + " \"" + path + "\"" );
-            }
-
-            if ( permissions != null && permissions.getFileMode() != null )
-            {
-                //executor.executeCommand( "chmod -Rf " + permissions.getFileMode() + " " + path );
-                executor.executeCommand( "chmod -Rf " + permissions.getFileMode() + " \"" + path + "\"" );
-            }
+            return;
         }
         catch ( CommandExecutionException e )
         {
             throw new TransferFailedException( "Error performing commands for file transfer", e );
+        }
+    }
+
+    private void uploadFiles( Wagon wagon, String destinationDirectory, File archive, String command )
+        throws TransferFailedException, ResourceDoesNotExistException, AuthorizationException, CommandExecutionException
+    {
+        Repository repository = wagon.getRepository();
+
+        String basedir = repository.getBasedir();
+
+        String destDir = StringUtils.replace( destinationDirectory, "\\", "/" );
+
+        String path = getPath( basedir, destDir );
+
+        // upload archive
+        wagon.put( archive, getPath( destinationDirectory, archive.getName() ) );
+
+        // uncompress
+        executor.executeCommand("cd \"" + path + "\"; " + command + "; rm -f \"" + archive.getName() + "\"");
+
+        // set permissions
+        RepositoryPermissions permissions = repository.getPermissions();
+
+        if (permissions != null && permissions.getGroup() != null) {
+            //executor.executeCommand( "chgrp -Rf " + permissions.getGroup() + " " + path );
+            executor.executeCommand("chgrp -Rf " + permissions.getGroup() + " \"" + path + "\"");
+        }
+
+        if (permissions != null && permissions.getFileMode() != null) {
+            //executor.executeCommand( "chmod -Rf " + permissions.getFileMode() + " " + path );
+            executor.executeCommand("chmod -Rf " + permissions.getFileMode() + " \"" + path + "\"");
         }
     }
 
